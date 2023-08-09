@@ -2,7 +2,7 @@
 
 
 # Laravel Zeus
-provide you with a collection of Laravel packages that helps you build your site faster and focus on your business
+provide you with a collection of Laravel and Filament packages that helps you build your site faster and focus on your business
 
-* website: https://larazeus.com/
-* demo: https://demo.larazeus.com/
+* Website: https://larazeus.com
+* Demo: https://demo.larazeus.com
