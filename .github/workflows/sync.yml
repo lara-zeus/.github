@@ -1,0 +1,353 @@
+name: Sync .github files
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    name: Sync .github files to repositories
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup GitHub CLI
+        uses: ./actions/setup-gh-cli
+
+      - name: Validate inputs
+        id: validate
+        run: |
+          set -euo pipefail
+
+          REPO_COUNT=$(jq 'keys | length' sync-repos.json)
+          if [ "$REPO_COUNT" -eq 0 ]; then
+            echo "::warning::No repositories configured in sync-repos.json"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Build grep exclusion pattern from .syncignore
+          SYNCIGNORE_FILTER=""
+          if [ -f .syncignore ]; then
+            while IFS= read -r PATTERN; do
+              [[ -z "$PATTERN" || "$PATTERN" == \#* ]] && continue
+              SYNCIGNORE_FILTER+=" | grep -v '^${PATTERN}'"
+            done < .syncignore
+          fi
+
+          # Collect all files under .github/ excluding .syncignore patterns
+          mapfile -t FILES < <(eval "find .github -type f | sort $SYNCIGNORE_FILTER")
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "::warning::No files found in .github/ (after applying .syncignore)"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "repos=$REPO_COUNT repo(s), files=${#FILES[@]} file(s)"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Sync files to each repository
+        if: steps.validate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          ORG="lara-zeus"
+          LABELS_FILE="sync-labels.json"
+
+          # Build grep exclusion pattern from .syncignore
+          SYNCIGNORE_FILTER=""
+          if [ -f .syncignore ]; then
+            while IFS= read -r PATTERN; do
+              [[ -z "$PATTERN" || "$PATTERN" == \#* ]] && continue
+              SYNCIGNORE_FILTER+=" | grep -v '^${PATTERN}'"
+            done < .syncignore
+          fi
+
+          # Collect all files under .github/ excluding .syncignore patterns
+          mapfile -t FILES < <(eval "find .github -type f | sort $SYNCIGNORE_FILTER")
+
+          echo "Syncing ${#FILES[@]} file(s)…"
+          echo ""
+
+          # --- Precompute labels from issue templates ---
+          REQUIRED_LABELS=()
+          for FILE in "${FILES[@]}"; do
+            [[ "$FILE" == .github/ISSUE_TEMPLATE/* ]] || continue
+            [ -f "$FILE" ] || continue
+            mapfile -t FILE_LABELS < <(grep -oP '(?<=labels:\s\[)[^\]]+' "$FILE" | tr ',' '\n' | sed 's/^[" ]*//;s/[" ]*$//')
+            for L in "${FILE_LABELS[@]}"; do
+              [[ -n "$L" ]] && REQUIRED_LABELS+=("$L")
+            done
+          done
+          mapfile -t REQUIRED_LABELS < <(printf '%s\n' "${REQUIRED_LABELS[@]}" | sort -u)
+
+          # --- Load label colors from sync-labels.json ---
+          declare -A LABEL_COLORS
+          if [ -f "$LABELS_FILE" ]; then
+            while IFS=$'\t' read -r LNAME LCOLOR; do
+              LABEL_COLORS["$LNAME"]="$LCOLOR"
+            done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' "$LABELS_FILE")
+          fi
+
+          RESULTS_DIR=$(mktemp -d)
+          TOTAL=0
+
+          # --- Per-repo-branch sync function (runs as background process) ---
+          sync_branch() {
+            local REPO="$1"
+            local BRANCH="$2"
+            local RESULT_KEY="${REPO##*/}@${BRANCH}"
+            local LOG="$RESULTS_DIR/$RESULT_KEY.log"
+            local RESULT_FILE="$RESULTS_DIR/$RESULT_KEY.result"
+            local ERROR_FILE="$RESULTS_DIR/$RESULT_KEY.error"
+
+            (
+              _mark_failed() {
+                echo "failed" > "$RESULT_FILE"
+              }
+              trap _mark_failed ERR
+              set -euo pipefail
+
+              echo "Branch: $BRANCH"
+
+              # Verify branch exists
+              if ! gh api "repos/$REPO/git/ref/heads/$BRANCH" > /dev/null 2>&1; then
+                echo "Branch '$BRANCH' not found in $REPO" > "$ERROR_FILE"
+                echo "failed" > "$RESULT_FILE"
+                exit 0
+              fi
+
+              # Create/update labels in parallel (once per repo, but safe to repeat)
+              for LABEL in "${REQUIRED_LABELS[@]}"; do
+                (
+                  COLOR="${LABEL_COLORS[$LABEL]:-ededed}"
+                  ENCODED_LABEL=$(printf '%s' "$LABEL" | jq -sRr @uri)
+                  if gh api --method POST "repos/$REPO/labels" \
+                    -f name="$LABEL" -f color="$COLOR" > /dev/null 2>&1; then
+                    echo "  Created label: $LABEL"
+                  else
+                    if ! gh api --method PATCH "repos/$REPO/labels/$ENCODED_LABEL" \
+                      -f color="$COLOR" > /dev/null 2>&1; then
+                      echo "  Failed to sync label: $LABEL"
+                    else
+                      echo "  Updated label: $LABEL"
+                    fi
+                  fi
+                ) &
+              done
+              wait
+
+              if ! LATEST_SHA=$(gh api "repos/$REPO/git/ref/heads/$BRANCH" --jq '.object.sha' 2>&1); then
+                echo "Failed to get latest SHA for $REPO@$BRANCH: $LATEST_SHA" > "$ERROR_FILE"
+                echo "failed" > "$RESULT_FILE"
+                exit 0
+              fi
+
+              if ! BASE_TREE=$(gh api "repos/$REPO/git/commits/$LATEST_SHA" --jq '.tree.sha' 2>&1); then
+                echo "Failed to get base tree for $REPO@$BRANCH: $BASE_TREE" > "$ERROR_FILE"
+                echo "failed" > "$RESULT_FILE"
+                exit 0
+              fi
+
+              # Create blobs in parallel
+              local BLOB_DIR="$RESULTS_DIR/$RESULT_KEY.blobs"
+              mkdir -p "$BLOB_DIR"
+              local BLOB_FAILED=false
+              for FILE in "${FILES[@]}"; do
+                [ -f "$FILE" ] || continue
+                (
+                  BLOB_KEY=$(echo "$FILE" | md5sum | cut -d' ' -f1)
+                  if ! BLOB_SHA=$(gh api --method POST "repos/$REPO/git/blobs" \
+                    -f content="$(base64 -w 0 < "$FILE")" \
+                    -f encoding="base64" \
+                    --jq '.sha' 2>&1); then
+                    echo "Failed to create blob for $FILE: $BLOB_SHA" >> "$ERROR_FILE"
+                    exit 1
+                  fi
+                  echo "$BLOB_SHA" > "$BLOB_DIR/$BLOB_KEY.sha"
+                  echo "  Prepared: $FILE"
+                ) &
+              done
+              wait
+
+              # Check if any blob creation failed
+              if [ -f "$ERROR_FILE" ]; then
+                echo "failed" > "$RESULT_FILE"
+                exit 0
+              fi
+
+              # Build tree entries from blob results
+              TREE_ENTRIES="[]"
+              for FILE in "${FILES[@]}"; do
+                [ -f "$FILE" ] || continue
+                BLOB_KEY=$(echo "$FILE" | md5sum | cut -d' ' -f1)
+                if [ ! -f "$BLOB_DIR/$BLOB_KEY.sha" ]; then
+                  echo "Missing blob for $FILE in $REPO@$BRANCH" > "$ERROR_FILE"
+                  echo "failed" > "$RESULT_FILE"
+                  exit 0
+                fi
+                BLOB_SHA=$(cat "$BLOB_DIR/$BLOB_KEY.sha")
+                TREE_ENTRIES=$(echo "$TREE_ENTRIES" | jq \
+                  --arg path "$FILE" \
+                  --arg sha "$BLOB_SHA" \
+                  '. + [{"path": $path, "mode": "100644", "type": "blob", "sha": $sha}]')
+              done
+
+              # Clean up remote .github/ files not in local source (respecting .syncignore)
+              mapfile -t REMOTE_PATHS < <(eval "gh api 'repos/$REPO/git/trees/$BASE_TREE?recursive=1' \
+                --jq '.tree[] | select(.type == \"blob\") | .path' 2>/dev/null \
+                | grep '^\.github/' $SYNCIGNORE_FILTER" || true)
+
+              for REMOTE_PATH in "${REMOTE_PATHS[@]}"; do
+                [[ -z "$REMOTE_PATH" ]] && continue
+                IS_LOCAL=false
+                for FILE in "${FILES[@]}"; do
+                  [[ "$REMOTE_PATH" == "$FILE" ]] && { IS_LOCAL=true; break; }
+                done
+                if [[ "$IS_LOCAL" == false ]]; then
+                  TREE_ENTRIES=$(echo "$TREE_ENTRIES" | jq \
+                    --arg path "$REMOTE_PATH" \
+                    '. + [{"path": $path, "mode": "100644", "type": "blob", "sha": null}]')
+                  echo "  Marked for deletion: $REMOTE_PATH"
+                fi
+              done
+
+              if ! NEW_TREE=$(jq -n \
+                --arg base "$BASE_TREE" \
+                --argjson tree "$TREE_ENTRIES" \
+                '{base_tree: $base, tree: $tree}' \
+                | gh api --method POST "repos/$REPO/git/trees" --input - --jq '.sha' 2>&1); then
+                echo "Failed to create tree for $REPO@$BRANCH: $NEW_TREE" > "$ERROR_FILE"
+                echo "failed" > "$RESULT_FILE"
+                exit 0
+              fi
+
+              if [ "$NEW_TREE" = "$BASE_TREE" ]; then
+                echo "  Already up to date"
+                echo "skipped" > "$RESULT_FILE"
+                exit 0
+              fi
+
+              if ! NEW_COMMIT=$(jq -n \
+                --arg msg "chore: sync .github files from .github repo" \
+                --arg tree "$NEW_TREE" \
+                --arg parent "$LATEST_SHA" \
+                '{message: $msg, tree: $tree, parents: [$parent]}' \
+                | gh api --method POST "repos/$REPO/git/commits" --input - --jq '.sha' 2>&1); then
+                echo "Failed to create commit for $REPO@$BRANCH: $NEW_COMMIT" > "$ERROR_FILE"
+                echo "failed" > "$RESULT_FILE"
+                exit 0
+              fi
+
+              if ! gh api --method PATCH "repos/$REPO/git/refs/heads/$BRANCH" \
+                -f sha="$NEW_COMMIT" > /dev/null 2>&1; then
+                echo "Failed to update ref for $REPO@$BRANCH" > "$ERROR_FILE"
+                echo "failed" > "$RESULT_FILE"
+                exit 0
+              fi
+
+              echo "  Synced successfully"
+              echo "success" > "$RESULT_FILE"
+            ) > "$LOG" 2>&1 || true
+
+            [ -f "$RESULT_FILE" ] || echo "failed" > "$RESULT_FILE"
+          }
+
+          # --- Launch repos/branches in parallel with concurrency limit ---
+          MAX_PARALLEL=5
+          RUNNING=0
+          RESULT_KEYS=()
+
+          mapfile -t REPO_NAMES < <(jq -r 'keys[]' sync-repos.json)
+          for REPO_NAME in "${REPO_NAMES[@]}"; do
+            REPO="$ORG/$REPO_NAME"
+
+            # If branches array is empty, fall back to default branch
+            BRANCH_COUNT=$(jq --arg r "$REPO_NAME" '.[$r] | length' sync-repos.json)
+            if [ "$BRANCH_COUNT" -eq 0 ]; then
+              DEFAULT_BRANCH=$(gh api "repos/$REPO" --jq '.default_branch' 2>/dev/null || echo "main")
+              BRANCHES=("$DEFAULT_BRANCH")
+            else
+              mapfile -t BRANCHES < <(jq -r --arg r "$REPO_NAME" '.[$r][]' sync-repos.json)
+            fi
+
+            for BRANCH in "${BRANCHES[@]}"; do
+              RESULT_KEY="${REPO_NAME}@${BRANCH}"
+              RESULT_KEYS+=("$RESULT_KEY")
+              TOTAL=$((TOTAL + 1))
+
+              sync_branch "$REPO" "$BRANCH" &
+              RUNNING=$((RUNNING + 1))
+              if [ "$RUNNING" -ge "$MAX_PARALLEL" ]; then
+                wait -n || true
+                RUNNING=$((RUNNING - 1))
+              fi
+            done
+          done
+          wait || true
+
+          # --- Aggregate results and print logs ---
+          SUCCESS=0; SKIPPED=0; FAILED=0
+
+          FAILED_DETAILS=""
+          for RESULT_KEY in "${RESULT_KEYS[@]}"; do
+            echo "::group::$RESULT_KEY"
+            [ -f "$RESULTS_DIR/$RESULT_KEY.log" ] && cat "$RESULTS_DIR/$RESULT_KEY.log"
+            RESULT=$(cat "$RESULTS_DIR/$RESULT_KEY.result" 2>/dev/null || echo "failed")
+            case "$RESULT" in
+              success) SUCCESS=$((SUCCESS + 1)) ;;
+              skipped) SKIPPED=$((SKIPPED + 1)) ;;
+              *)
+                FAILED=$((FAILED + 1))
+                ERROR_MSG=""
+                if [ -f "$RESULTS_DIR/$RESULT_KEY.error" ]; then
+                  ERROR_MSG=$(cat "$RESULTS_DIR/$RESULT_KEY.error")
+                else
+                  ERROR_MSG="Unknown error (check logs above)"
+                fi
+                echo "::error::[$RESULT_KEY] $ERROR_MSG"
+                FAILED_DETAILS+="| $RESULT_KEY | $ERROR_MSG |"$'\n'
+                ;;
+            esac
+            echo "::endgroup::"
+          done
+
+          rm -rf "$RESULTS_DIR"
+
+          echo ""
+          echo "--- Summary ---"
+          echo "Synced:     $SUCCESS"
+          echo "Up to date: $SKIPPED"
+          echo "Failed:     $FAILED"
+          echo "Total:      $TOTAL"
+
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            {
+              echo "## Sync .github Files"
+              echo ""
+              echo "| Status | Count |"
+              echo "|--------|-------|"
+              echo "| Synced | $SUCCESS |"
+              echo "| Up to date | $SKIPPED |"
+              echo "| Failed | $FAILED |"
+              echo "| **Total** | **$TOTAL** |"
+
+              if [ -n "$FAILED_DETAILS" ]; then
+                echo ""
+                echo "### Errors"
+                echo ""
+                echo "| Repo@Branch | Error |"
+                echo "|-------------|-------|"
+                echo -n "$FAILED_DETAILS"
+              fi
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          if [ "$FAILED" -gt 0 ]; then
+            exit 1
+          fi
