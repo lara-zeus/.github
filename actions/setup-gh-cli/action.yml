@@ -1,0 +1,54 @@
+name: Setup GitHub CLI
+description: >
+  Installs the GitHub CLI (gh) following the official documentation.
+  On GitHub-hosted runners gh is pre-installed, so this is mainly
+  useful for self-hosted runners or when a specific version is needed.
+
+inputs:
+  version:
+    description: >
+      gh version to install (e.g. "2.67.0").
+      Leave empty to install the latest stable release.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Check if gh is already installed
+      id: check
+      shell: bash
+      run: |
+        if command -v gh &> /dev/null; then
+          echo "installed=true" >> "$GITHUB_OUTPUT"
+          echo "gh already available: $(gh --version | head -1)"
+        else
+          echo "installed=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Install GitHub CLI
+      if: steps.check.outputs.installed == 'false'
+      shell: bash
+      env:
+        GH_VERSION: ${{ inputs.version }}
+      run: |
+        sudo mkdir -p -m 755 /etc/apt/keyrings
+
+        out=$(mktemp)
+        wget -nv -O "$out" https://cli.github.com/packages/githubcli-archive-keyring.gpg
+        cat "$out" | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg > /dev/null
+        sudo chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] \
+        https://cli.github.com/packages stable main" \
+          | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+
+        sudo apt-get update -qq
+
+        if [ -n "$GH_VERSION" ]; then
+          sudo apt-get install -y -qq "gh=${GH_VERSION}"
+        else
+          sudo apt-get install -y -qq gh
+        fi
+
+        echo "Installed: $(gh --version | head -1)"
